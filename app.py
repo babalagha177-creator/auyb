@@ -1,11 +1,15 @@
+import os
+from io import BytesIO
+
 import requests
 import streamlit as st
 import pytz
 from datetime import datetime
 import pandas as pd
-import os
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from supabase import create_client
+
+# 1. إعدادات الصفحة (يجب أن يكون أول استدعاء لـ Streamlit)
+st.set_page_config(page_title="نظام باب الآغا", layout="wide")
 
 # تطبيع النص العربي للبحث (همزات/ياء/ألف مقصورة)
 def normalize_arabic_text(text):
@@ -20,33 +24,113 @@ def normalize_arabic_text(text):
         .replace("ئ", "ي")
     )
 
-def get_log_worksheet(spreadsheet_obj):
-    """يفتح ورقة Log أولاً، ثم Daily_Log كخيار احتياطي."""
-    for sheet_name in ["Log", "Daily_Log"]:
+def _normalize_secret_value(val) -> str:
+    """إزالة مسافات، BOM، أو علامات تنصيص لاصقة عند لصق المفتاح من لوحة Supabase."""
+    s = str(val or "").strip()
+    if s.startswith("\ufeff"):
+        s = s.lstrip("\ufeff").strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        s = s[1:-1].strip()
+    return s
+
+
+def _secrets_pick(*keys: str):
+    for k in keys:
         try:
-            return spreadsheet_obj.worksheet(sheet_name)
+            v = st.secrets[k]
         except Exception:
             continue
-    raise ValueError("تعذر العثور على ورقة Log أو Daily_Log")
+        if v is None:
+            continue
+        s = _normalize_secret_value(v)
+        if s:
+            return s
+    return ""
 
-# إعداد الربط مع جوجل شيت
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-try:
-    creds = ServiceAccountCredentials.from_json_keyfile_name("key.json", scope)
-    client = gspread.authorize(creds)
-    
-    # فتح الجدول بالرابط المباشر
-    spreadsheet = client.open_by_url("https://docs.google.com/spreadsheets/d/1OmmOv6D0jcxMxcSlPlfyH9-RgQoijsLrr4g34aZDeDg/edit")
-    
-    # تعريف الورقة الأولى (للسلع) والورقة الثانية (للجرد)
-    sheet = spreadsheet.get_worksheet(0) # الورقة الأولى
-    daily_sheet = get_log_worksheet(spreadsheet) # ورقة السجل: Log أو Daily_Log
-    
-    st.sidebar.success("✅ تم الاتصال بكافة الأوراق")
-except Exception as e:
-    st.sidebar.error(f"❌ خطأ في الربط: {e}")
-# 1. إعدادات الصفحة
-st.set_page_config(page_title="نظام باب الآغا", layout="wide")
+
+def resolve_supabase_credentials():
+    """
+    يدعم المفاتيح في الجذر أو داخل قسم [supabase] في TOML.
+    يقبل SUPABASE_KEY أو SUPABASE_ANON_KEY أو SUPABASE_SERVICE_ROLE_KEY.
+    """
+    url = ""
+    key = ""
+    nested = None
+    try:
+        nested = st.secrets["supabase"]
+    except Exception:
+        nested = None
+    if nested is not None and not isinstance(nested, str):
+        getter = getattr(nested, "get", None)
+        if callable(getter):
+            url = _normalize_secret_value(
+                getter("SUPABASE_URL") or getter("url") or ""
+            )
+            key = _normalize_secret_value(
+                getter("SUPABASE_KEY")
+                or getter("key")
+                or getter("SUPABASE_ANON_KEY")
+                or getter("SUPABASE_SERVICE_ROLE_KEY")
+                or ""
+            )
+    if not url:
+        url = _secrets_pick("SUPABASE_URL")
+    if not key:
+        key = _secrets_pick(
+            "SUPABASE_KEY",
+            "SUPABASE_SERVICE_ROLE_KEY",
+            "SUPABASE_ANON_KEY",
+        )
+    return url, key
+
+
+@st.cache_resource
+def _cached_supabase(url: str, key: str):
+    return create_client(url, key)
+
+
+def get_supabase_client():
+    url, key = resolve_supabase_credentials()
+    if not url or not key:
+        raise ValueError(
+            "SUPABASE_URL أو مفتاح Supabase فارغان داخل st.secrets "
+            "(توقع: SUPABASE_URL و SUPABASE_KEY أو SUPABASE_SERVICE_ROLE_KEY / SUPABASE_ANON_KEY)."
+        )
+    return _cached_supabase(url, key)
+
+
+supabase_client = None
+supabase_connection_error = ""
+
+
+def init_supabase():
+    global supabase_client, supabase_connection_error
+    try:
+        supabase_client = get_supabase_client()
+        supabase_connection_error = ""
+        st.sidebar.success("✅ تم الاتصال بقاعدة بيانات Supabase")
+    except Exception as e:
+        supabase_client = None
+        supabase_connection_error = str(e)
+        st.sidebar.error("❌ تعذر الاتصال بـ Supabase")
+        hint = ""
+        err_low = str(e).lower()
+        if "invalid api key" in err_low:
+            hint = (
+                "\n\n**تفسير شائع:** إن كان المفتاح يبدأ بـ `sb_secret_` أو `sb_publishable_` فإن إصدارات "
+                "`supabase` القديمة (مثل 2.15) ترفضها محلياً برسالة *Invalid API key* قبل أي اتصال. "
+                "حدّث الحزم (`pip install -r requirements.txt`) أو استخدم من لوحة Supabase قسماً **Legacy API keys** "
+                "وانسخ مفتاح **service_role** أو **anon** (سلسلة طويلة تبدأ بـ `eyJ`). "
+                "تأكد أن `SUPABASE_URL` لمشروعك يطابق نفس المشروع الذي نُسخ منه المفتاح."
+            )
+        st.error(
+            "فشل تهيئة Supabase. تحقق من `SUPABASE_URL` والمفتاح في `.streamlit/secrets.toml` "
+            "(أو أسرار التطبيق على Streamlit Cloud)، وأن الجداول `inventory_items` و `daily_audit_log` قد أُنشئت "
+            "(ملف `supabase_schema.sql`).\n\n"
+            f"التفاصيل: {supabase_connection_error}"
+            f"{hint}"
+        )
+
 
 st.markdown("""
     <style>
@@ -86,17 +170,230 @@ if not st.session_state['authenticated']:
                 st.rerun()
     st.stop()
 
-# 3. إدارة قاعدة البيانات
-DB_FILE = "inventory_list.csv"
-DAILY_LOG_FILE = "Daily_Log.csv"
-DAILY_LOG_HEADERS = ['التاريخ', 'الوقت', 'اسم السلعة', 'المتوفر', 'المطلوب', 'الوحدة', 'الملاحظات', 'اسم المسؤول']
-# ترتيب عرض جدول الخلفة (يمين -> يسار) مع الحفاظ على نفس أسماء الأعمدة الرسمية
-KHALLFA_RESULTS_ORDER = ["اسم السلعة", "المتوفر", "المطلوب", "الوحدة", "الملاحظات", "التاريخ", "الوقت", "اسم المسؤول"]
-daily_log_reset_message = None
-st.cache_data.clear()
+# 3. إدارة قاعدة البيانات (Supabase — سحابي بالكامل)
+DAILY_LOG_HEADERS = [
+    "التاريخ",
+    "الوقت",
+    "اسم السلعة",
+    "المتوفر",
+    "المطلوب",
+    "الوحدة",
+    "الملاحظات",
+    "اسم المسؤول",
+]
+KHALLFA_RESULTS_ORDER = [
+    "اسم السلعة",
+    "المتوفر",
+    "المطلوب",
+    "الوحدة",
+    "الملاحظات",
+    "التاريخ",
+    "الوقت",
+    "اسم المسؤول",
+]
+
+
+def _float_safe_cell(val):
+    try:
+        return float(str(val).replace(",", "").strip())
+    except Exception:
+        return 0.0
+
+
+def _audit_rows_as_dicts(df: pd.DataFrame):
+    df = normalize_log_columns(df)
+    rows = []
+    for _, r in df.iterrows():
+        rows.append(
+            {
+                "log_date": str(r["التاريخ"]).strip(),
+                "log_time": str(r["الوقت"]).strip(),
+                "item_name": str(r["اسم السلعة"]).strip(),
+                "available": _float_safe_cell(r["المتوفر"]),
+                "required": _float_safe_cell(r["المطلوب"]),
+                "unit_val": str(r["الوحدة"] or "").strip(),
+                "notes": str(r["الملاحظات"] or "").strip(),
+                "manager_label": str(r["اسم المسؤول"] or "").strip(),
+            }
+        )
+    return rows
+
+
+def append_log_rows_to_supabase(df: pd.DataFrame):
+    if df is None or df.empty or supabase_client is None:
+        return
+    rows = _audit_rows_as_dicts(df)
+    if not rows:
+        return
+    supabase_client.table("daily_audit_log").insert(rows).execute()
+
+
+def fetch_audit_log_for_admin(limit: int = 25000):
+    cols = "log_date, log_time, item_name, available, required, unit_val, notes, manager_label"
+    if supabase_client is None:
+        return pd.DataFrame(
+            columns=[
+                "log_date",
+                "log_time",
+                "item_name",
+                "available",
+                "required",
+                "unit_val",
+                "notes",
+                "manager_label",
+            ]
+        )
+    res = (
+        supabase_client.table("daily_audit_log")
+        .select(cols)
+        .order("id", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return pd.DataFrame(res.data or [])
+
+
+def fetch_today_audit_rows(today_value: str, max_rows: int = 12000):
+    cols = "log_date, log_time, item_name, available, required, unit_val, notes, manager_label"
+    if supabase_client is None:
+        return pd.DataFrame(columns=DAILY_LOG_HEADERS)
+    res = (
+        supabase_client.table("daily_audit_log")
+        .select(cols)
+        .eq("log_date", today_value)
+        .order("id", desc=True)
+        .limit(max_rows)
+        .execute()
+    )
+    if not res.data:
+        return pd.DataFrame(columns=DAILY_LOG_HEADERS)
+    dfp = pd.DataFrame(res.data)
+    dfp = dfp.rename(
+        columns={
+            "log_date": "التاريخ",
+            "log_time": "الوقت",
+            "item_name": "اسم السلعة",
+            "available": "المتوفر",
+            "required": "المطلوب",
+            "unit_val": "الوحدة",
+            "notes": "الملاحظات",
+            "manager_label": "اسم المسؤول",
+        }
+    )
+    return dfp[DAILY_LOG_HEADERS]
+
+
+def clear_supabase_audit_log():
+    if supabase_client is None:
+        raise RuntimeError("Supabase غير متصل.")
+    # حذف جميع الصفوف: شرط دائم صحيح على مفتاح تسلسلي
+    supabase_client.table("daily_audit_log").delete().neq("id", 0).execute()
+
+
+def format_admin_audit_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """أعمدة عربية للعرض: التاريخ، الوقت، المادة، اسم الخلفة، المسؤول، المتوفر، المطلوب، الوحدة، الملاحظات."""
+    if df is None or df.empty:
+        return pd.DataFrame(
+            columns=[
+                "التاريخ",
+                "الوقت",
+                "المادة",
+                "اسم الخلفة",
+                "المسؤول",
+                "المتوفر",
+                "المطلوب",
+                "الوحدة",
+                "الملاحظات",
+            ]
+        )
+
+    def split_khallfa(label: str):
+        s = str(label or "").strip()
+        if " - " in s:
+            shift_part, name_part = s.split(" - ", 1)
+            return name_part.strip(), s
+        return s, s
+
+    kh_list, mgr_list = [], []
+    for lbl in df["manager_label"].tolist():
+        k, m = split_khallfa(lbl)
+        kh_list.append(k)
+        mgr_list.append(m)
+
+    out = pd.DataFrame(
+        {
+            "التاريخ": df["log_date"].astype(str),
+            "الوقت": df["log_time"].astype(str),
+            "المادة": df["item_name"].astype(str),
+            "اسم الخلفة": kh_list,
+            "المسؤول": mgr_list,
+            "المتوفر": df["available"],
+            "المطلوب": df["required"],
+            "الوحدة": df["unit_val"].astype(str).fillna(""),
+            "الملاحظات": df["notes"].astype(str).fillna(""),
+        }
+    )
+    return out
+
+
+def build_audit_pdf_bytes(display_df: pd.DataFrame) -> bytes:
+    """تقرير PDF بخط يدعم العربية (يتم تنزيل خط Noto عند أول استخدام)."""
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.pdfgen import canvas
+
+    font_dir = os.path.join(os.path.expanduser("~"), ".cache", "babalagha_inventory_fonts")
+    os.makedirs(font_dir, exist_ok=True)
+    font_path = os.path.join(font_dir, "NotoNaskhArabic-Regular.ttf")
+    if not os.path.isfile(font_path) or os.path.getsize(font_path) < 5000:
+        font_url = (
+            "https://raw.githubusercontent.com/googlefonts/noto-naskh-arabic/main/"
+            "fonts/ttf/hinted/ttf/NotoNaskhArabic-Regular.ttf"
+        )
+        r = requests.get(font_url, timeout=90)
+        r.raise_for_status()
+        with open(font_path, "wb") as f:
+            f.write(r.content)
+
+    pdfmetrics.registerFont(TTFont("NotoNaskh", font_path))
+
+    buf = BytesIO()
+    w, h = A4
+    c = canvas.Canvas(buf, pagesize=A4)
+    c.setTitle("سجل الجرد")
+    c.setFont("NotoNaskh", 13)
+    title = get_display(arabic_reshaper.reshape("مخابز باب الآغا — سجل الجرد"))
+    c.drawRightString(w - 36, h - 40, title)
+
+    y = h - 62
+    c.setFont("NotoNaskh", 8)
+    if display_df is None or display_df.empty:
+        line = get_display(arabic_reshaper.reshape("لا توجد سجلات."))
+        c.drawRightString(w - 36, y, line)
+        c.save()
+        return buf.getvalue()
+
+    for _, row in display_df.iterrows():
+        parts = [str(row[col]) for col in display_df.columns]
+        raw_line = "  |  ".join(parts)
+        shaped = get_display(arabic_reshaper.reshape(raw_line))
+        if len(shaped) > 95:
+            shaped = shaped[:92] + "..."
+        c.drawRightString(w - 36, y, shaped)
+        y -= 11
+        if y < 48:
+            c.showPage()
+            c.setFont("NotoNaskh", 8)
+            y = h - 36
+    c.save()
+    return buf.getvalue()
+
 
 def get_section_by_item(item_name: str) -> str:
-    """إرجاع القسم المرتبط بالسلعة من قاعدة السلع المحلية."""
+    """إرجاع القسم المرتبط بالسلعة من جدول السلع في Supabase (المحفوظ في الجلسة)."""
     try:
         items_df = st.session_state.get("inventory_db", pd.DataFrame())
         if items_df.empty or "السلعة" not in items_df.columns or "القسم" not in items_df.columns:
@@ -108,25 +405,6 @@ def get_section_by_item(item_name: str) -> str:
     except Exception:
         return "عام"
 
-def ensure_daily_log_file():
-    global daily_log_reset_message
-    if not os.path.exists(DAILY_LOG_FILE):
-        pd.DataFrame(columns=DAILY_LOG_HEADERS).to_csv(DAILY_LOG_FILE, index=False, encoding="utf-8-sig")
-        return
-    try:
-        existing_df = pd.read_csv(DAILY_LOG_FILE)
-        if list(existing_df.columns) != DAILY_LOG_HEADERS:
-            # إذا كان الملف القديم بعناوين خاطئة: ننشئ نسخة احتياطية ونبدأ ملفاً جديداً صحيحاً
-            backup_name = f"Daily_Log_legacy_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-            os.replace(DAILY_LOG_FILE, backup_name)
-            pd.DataFrame(columns=DAILY_LOG_HEADERS).to_csv(DAILY_LOG_FILE, index=False, encoding="utf-8-sig")
-            daily_log_reset_message = (
-                f"تم إنشاء ملف سجل جديد بالعناوين الصحيحة. "
-                f"تم حفظ الملف القديم كنسخة احتياطية: {backup_name}"
-            )
-    except Exception:
-        pd.DataFrame(columns=DAILY_LOG_HEADERS).to_csv(DAILY_LOG_FILE, index=False, encoding="utf-8-sig")
-
 def normalize_log_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     توحيد أعمدة السجل مع DAILY_LOG_HEADERS مهما كان مصدر الملف
@@ -134,7 +412,7 @@ def normalize_log_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     normalized = df.copy()
 
-    # توحيد أي مسميات قديمة/بديلة عند العرض فقط (لا يغيّر ملف CSV على القرص)
+    # توحيد أي مسميات قديمة/بديلة عند العرض فقط
     display_aliases = {
         "اسم الخلفة": "الوحدة",
         "الخلفة": "الوحدة",
@@ -207,20 +485,15 @@ def render_khallfa_results(today_value: str):
             st.rerun()
 
     try:
-        if os.path.exists(DAILY_LOG_FILE):
-            display_df = pd.read_csv(DAILY_LOG_FILE)
-        else:
-            all_rows = daily_sheet.get_all_records()
-            display_df = pd.DataFrame(all_rows)
+        display_df = fetch_today_audit_rows(today_value)
 
         if display_df.empty:
             st.info("لا توجد بيانات مسجلة حالياً.")
             return
 
         display_df = normalize_log_columns(display_df)
-        # تثبيت أسماء الأعمدة بشكل صريح حتى لو المصدر قديم أو مشوّه
         display_df.columns = DAILY_LOG_HEADERS
-        today_rows = display_df[display_df["التاريخ"].astype(str).str.strip() == today_value]
+        today_rows = display_df[display_df["التاريخ"].astype(str).str.strip() == today_value].copy()
 
         today_rows["القسم"] = today_rows["اسم السلعة"].astype(str).apply(get_section_by_item)
 
@@ -291,24 +564,40 @@ def render_khallfa_results(today_value: str):
         """
         st.markdown(results_table_html, unsafe_allow_html=True)
     except Exception as e:
-        st.warning(f"تعذر تحميل نتائج اليوم من Google Sheet: {e}")
+        st.warning(f"تعذر تحميل نتائج اليوم من Supabase: {e}")
+
 
 def load_items():
-    if os.path.exists(DB_FILE):
-        try:
-            df = pd.read_csv(DB_FILE)
-            if df.empty:
-                return pd.DataFrame(columns=["السلعة", "الحد_الأدنى", "الخلفة", "القسم", "الوحدة"])
-            return df
-        except Exception:
-            return pd.DataFrame(columns=["السلعة", "الحد_الأدنى", "الخلفة", "القسم", "الوحدة"])
-    return pd.DataFrame(columns=["السلعة", "الحد_الأدنى", "الخلفة", "القسم", "الوحدة"])
+    empty = pd.DataFrame(columns=["السلعة", "الحد_الأدنى", "الخلفة", "القسم", "الوحدة"])
+    if supabase_client is None:
+        return empty
+    try:
+        res = (
+            supabase_client.table("inventory_items")
+            .select("item_name, min_qty, unit_val, section_name, khallfa")
+            .order("item_name")
+            .execute()
+        )
+        if not res.data:
+            return empty
+        raw = pd.DataFrame(res.data)
+        return raw.rename(
+            columns={
+                "item_name": "السلعة",
+                "min_qty": "الحد_الأدنى",
+                "unit_val": "الوحدة",
+                "section_name": "القسم",
+                "khallfa": "الخلفة",
+            }
+        )
+    except Exception:
+        return empty
 
-if 'inventory_db' not in st.session_state:
+
+init_supabase()
+
+if "inventory_db" not in st.session_state:
     st.session_state.inventory_db = load_items()
-ensure_daily_log_file()
-if daily_log_reset_message:
-    st.sidebar.warning(daily_log_reset_message)
 
 # ميزة حفظ الكميات في الذاكرة لكي لا تضيع عند التنقل
 if 'quantities' not in st.session_state:
@@ -335,7 +624,23 @@ if khallfa_on_duty:
 # 5. القائمة الجانبية
 st.sidebar.title("🏢 إدارة باب الآغا")
 st.sidebar.info(f"الشفت الحالي: {current_shift}")
-menu = st.sidebar.radio("انتقل إلى:", ["🏠 الرئيسية", "📦 الجرد والمخزون", "⚙️ إدارة السلع", "🖨️ الطباعة والواتساب"])
+menu = st.sidebar.radio(
+    "انتقل إلى:",
+    [
+        "🏠 الرئيسية",
+        "📦 الجرد والمخزون",
+        "⚙️ إدارة السلع",
+        "🔐 بوابة الإدارة (للمدير)",
+        "🖨️ الطباعة والواتساب",
+    ],
+)
+
+st.sidebar.write("---")
+st.sidebar.subheader("🗑️ عمليات سريعة")
+if st.sidebar.button("🧹 مسح جرد اليوم (تصفير)", key="sidebar_clear_today_qty"):
+    st.session_state.quantities = {}
+    st.sidebar.success("تم تصفير الأرقام بنجاح!")
+    st.rerun()
 
 # --- القسم 1: الرئيسية ---
 if menu == "🏠 الرئيسية":
@@ -351,9 +656,32 @@ elif menu == "📦 الجرد والمخزون":
     
     # عرض السلع من قاعدة البيانات
     df = st.session_state.inventory_db
-    filtered_df = df[df['السلعة'].str.contains(search)] if search else df
+    if search:
+        filtered_df = df[df["السلعة"].astype(str).str.contains(search, regex=False, na=False)]
+    else:
+        filtered_df = df
 
-    for index, row in filtered_df.iterrows():
+    inv_total = len(filtered_df)
+    page_size = 80
+    total_pages = max(1, (inv_total + page_size - 1) // page_size)
+    if inv_total > page_size:
+        st.caption(
+            f"إجمالي {inv_total} سلعة — عرض {page_size} لكل صفحة. استخدم البحث لتقليل القائمة عند الحاجة."
+        )
+        page_num = st.number_input(
+            "رقم الصفحة",
+            min_value=1,
+            max_value=total_pages,
+            value=1,
+            step=1,
+            key="inventory_page",
+        )
+        start_idx = (int(page_num) - 1) * page_size
+        page_df = filtered_df.iloc[start_idx : start_idx + page_size]
+    else:
+        page_df = filtered_df
+
+    for index, row in page_df.iterrows():
         item_name = row['السلعة']
         unit = row['الوحدة']
         min_val = row['الحد_الأدنى']
@@ -395,17 +723,13 @@ elif menu == "📦 الجرد والمخزون":
                 st.success("✅ الكمية كافية")
     # تثبيت جدول نتائج الخلفة لليوم أسفل صفحة الجرد
     render_khallfa_results(iraq_now.strftime('%Y-%m-%d'))
-# --- زر تفريغ البيانات (تضعه هنا بالضبط) ---
-st.sidebar.write("---") # خط فاصل للتنسيق
-st.sidebar.subheader("🗑️ عمليات سريعة")
-if st.sidebar.button("🧹 مسح جرد اليوم (تصفير)"):
-    # هذا الأمر يفرغ كل الأرقام والملاحظات التي أدخلتها
-    st.session_state.quantities = {}
-    st.sidebar.success("تم تصفير الأرقام بنجاح!")
-    st.rerun() # لإعادة إنعاش الصفحة فوراً
+
 # --- القسم 3: إدارة السلع ---
-if menu == "⚙️ إدارة السلع":
+elif menu == "⚙️ إدارة السلع":
     st.header("⚙️ التحكم في قائمة السلع")
+    st.caption(
+        "مسح سجل الجرد السحابي بالكامل يتم من قسم «بوابة الإدارة» مع التحقق المزدوج بكلمة المرور."
+    )
     admin_items_password_ok = st.session_state.get("admin_items_password_ok", False)
     if not admin_items_password_ok:
         items_password = st.text_input("🔒 كلمة مرور إدارة السلع", type="password", key="items_admin_password")
@@ -433,78 +757,155 @@ if menu == "⚙️ إدارة السلع":
                 section_name = st.text_input("القسم", value="عام")
                 if st.form_submit_button("حفظ السلعة"):
                     if name:
-                        # 1. الحفظ المحلي في جهازك
                         clean_section = str(section_name or "").strip() or "عام"
-                        new_data = pd.DataFrame([{"القسم": clean_section, "الخلفة": "", "الحد_الأدنى": limit, "السلعة": name, "الوحدة": unit}])
-                        st.session_state.inventory_db = pd.concat([st.session_state.inventory_db, new_data], ignore_index=True)
-                        st.session_state.inventory_db.to_csv(DB_FILE, index=False)
-                        st.cache_data.clear()
-                        
-                        # 2. الحفظ السحابي مع توجيه القسم إلى العمود I (الخانة 9)
-                        try:
-                            # A..I مع وضع "القسم" في I فقط وعدم المساس بأعمدة A..H
-                            manager_row = [iraq_now.strftime('%Y-%m-%d'), time_now, name, 0, limit, "إضافة جديدة", "", "", clean_section]
-                            
-                            # إدخال السطر في ورقة السلع (Sheet1)
-                            sheet.insert_row(manager_row, 2)
-                            
-                            st.success(f"✅ تم إضافة السلعة ({name}) بنجاح إلى النظام وقاعدة البيانات السحابية")
-                        except Exception as e:
-                            st.error(f"❌ الاتصال نجح لكن الإرسال فشل: {e}")
-                        
+                        if supabase_client is None:
+                            st.error("❌ Supabase غير متصل. تحقق من الأسرار والجداول.")
+                        else:
+                            try:
+                                supabase_client.table("inventory_items").insert(
+                                    {
+                                        "item_name": str(name).strip(),
+                                        "min_qty": float(limit),
+                                        "unit_val": unit,
+                                        "section_name": clean_section,
+                                        "khallfa": "",
+                                    }
+                                ).execute()
+                                st.session_state.inventory_db = load_items()
+                                st.cache_data.clear()
+                                st.success(f"✅ تم إضافة السلعة ({name}) بنجاح في Supabase")
+                            except Exception as e:
+                                st.error(f"❌ فشل حفظ السلعة في السحابة: {e}")
                         st.rerun()
 
         st.write("---")
 
         # 2. واجهة الحذف
         st.subheader("🗑️ حذف سلعة من النظام")
-        # نضع قائمة منسدلة بأسماء كل السلع الموجودة حالياً
-        list_of_items = st.session_state.inventory_db['السلعة'].tolist()
-        
-        item_to_delete = st.selectbox("اختر السلعة التي تريد حذفها نهائياً:", list_of_items)
+        del_search = st.text_input(
+            "🔍 تصفية السلع قبل الاختيار (مهم عند وجود آلاف الأصناف)",
+            key="delete_item_filter",
+        )
+        all_names = st.session_state.inventory_db["السلعة"].astype(str).tolist()
+        if del_search.strip():
+            q = del_search.strip()
+            list_of_items = [n for n in all_names if q in n]
+            if len(list_of_items) > 500:
+                list_of_items = list_of_items[:500]
+                st.caption("عرض أول 500 تطابق — اضيق عبارة البحث لرؤية المزيد بدقة.")
+        else:
+            list_of_items = all_names[:400]
+            if len(all_names) > 400:
+                st.caption(
+                    f"عرض أول 400 سلعة من أصل {len(all_names)}. اكتب في خانة التصفية للعثور على سلعة محددة."
+                )
+        if not list_of_items:
+            st.warning("لا توجد سلع مطابقة للتصفية الحالية.")
+            item_to_delete = None
+        else:
+            item_to_delete = st.selectbox(
+                "اختر السلعة التي تريد حذفها نهائياً:",
+                list_of_items,
+                key="delete_item_pick",
+            )
         
         # زر الحذف مع تأكيد لونه أحمر
-        if st.button(f"❌ حذف سلعة ({item_to_delete}) الآن"):
-            # نقوم بفلترة البيانات ونأخذ كل شيء "عدا" السلعة المختارة
-            st.session_state.inventory_db = st.session_state.inventory_db[st.session_state.inventory_db['السلعة'] != item_to_delete]
-            
-            # حفظ التغيير في الملف فوراً لكي لا تعود السلعة مرة أخرى
-            st.session_state.inventory_db.to_csv(DB_FILE, index=False)
-            st.cache_data.clear()
-            
-            st.error(f"⚠️ تم حذف {item_to_delete} من النظام بنجاح.")
-            st.rerun() # لتحديث القائمة وإخفائها من الجرد فوراً
-
-    st.write("---")
-    st.subheader("🔐 إعدادات المدير")
-    with st.expander("🧨 إعادة تهيئة سجل Daily_Log (للمدير فقط)"):
-        reset_password = st.text_input("كلمة مرور المدير", type="password", key="manager_reset_password")
-        if reset_password == "1948baba":
-            st.warning("سيتم حذف ملف Daily_Log.csv المحلي فقط. لن يتم تعديل Google Sheets.")
-            confirm_reset = st.checkbox("نعم، أنا متأكد من حذف سجل Daily_Log المحلي", key="confirm_daily_log_reset")
-            if st.button("✅ تنفيذ إعادة التهيئة الآن", key="do_daily_log_reset"):
-                if confirm_reset:
-                    try:
-                        if os.path.exists(DAILY_LOG_FILE):
-                            os.remove(DAILY_LOG_FILE)
-                    except Exception:
-                        pass
-                    # fallback مضمون: إنشاء ملف جديد بهيدر نظيف حتى لو فشل الحذف
-                    pd.DataFrame(columns=DAILY_LOG_HEADERS).to_csv(
-                        DAILY_LOG_FILE,
-                        index=False,
-                        encoding="utf-8-sig"
-                    )
+        if item_to_delete and st.button(f"❌ حذف سلعة ({item_to_delete}) الآن"):
+            if supabase_client is None:
+                st.error("❌ Supabase غير متصل.")
+            else:
+                try:
+                    supabase_client.table("inventory_items").delete().eq("item_name", item_to_delete).execute()
+                    st.session_state.inventory_db = load_items()
                     st.cache_data.clear()
-                    st.session_state.clear()
-                    st.success("تمت إعادة تهيئة ملف Daily_Log.csv المحلي بنجاح.")
-                    st.rerun()
-                else:
-                    st.error("يرجى تفعيل خيار التأكيد قبل تنفيذ المسح.")
-        elif reset_password:
-            st.error("كلمة المرور غير صحيحة.")
-            # --- القسم 4: الطباعة والواتساب (التحديث النهائي) ---
-if menu == "🖨️ الطباعة والواتساب":
+                    st.error(f"⚠️ تم حذف {item_to_delete} من النظام بنجاح.")
+                except Exception as e:
+                    st.error(f"❌ فشل الحذف من السحابة: {e}")
+            st.rerun()
+
+elif menu == "🔐 بوابة الإدارة (للمدير)":
+    st.header("🔐 بوابة الإدارة (للمدير)")
+    if not st.session_state.get("admin_portal_unlocked"):
+        apw = st.text_input("كلمة مرور بوابة الإدارة", type="password", key="admin_portal_gate_pw")
+        if st.button("تأكيد الدخول", key="admin_portal_gate_btn"):
+            if apw == "1948baba":
+                st.session_state.admin_portal_unlocked = True
+                st.success("تم الدخول.")
+                st.rerun()
+            else:
+                st.error("كلمة المرور غير صحيحة.")
+        st.info("هذا القسم للاطلاع على سجل الجرد المحفوظ في Supabase وتحميله أو مسحه بحرص شديد.")
+    else:
+        if st.button("🔒 خروج من بوابة الإدارة", key="admin_portal_gate_leave"):
+            st.session_state.admin_portal_unlocked = False
+            st.rerun()
+        try:
+            raw_audit = fetch_audit_log_for_admin()
+            display_audit = format_admin_audit_dataframe(raw_audit)
+            st.caption(
+                f"عدد السجلات المعروضة: {len(display_audit)} — الوقت والتاريخ كما خُزّنا عند الإرسال (Asia/Baghdad)."
+            )
+            st.dataframe(display_audit, use_container_width=True, height=520)
+            csv_payload = display_audit.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                label="📥 تحميل كملف Excel (CSV)",
+                data=csv_payload,
+                file_name="سجل_الجرد_المدير.csv",
+                mime="text/csv",
+                key="admin_audit_download_csv",
+            )
+            try:
+                pdf_bytes = build_audit_pdf_bytes(display_audit)
+                st.download_button(
+                    label="📄 تحميل كملف PDF",
+                    data=pdf_bytes,
+                    file_name="سجل_الجرد_المدير.pdf",
+                    mime="application/pdf",
+                    key="admin_audit_download_pdf",
+                )
+            except Exception as pdf_err:
+                st.warning(f"تعذر تجهيز ملف PDF: {pdf_err}")
+
+            st.write("---")
+            with st.expander("⚙️ خيارات متقدمة للمدير", expanded=False):
+                st.caption("مسح السجل السحابي يتطلب إعادة إدخال كلمة المرور ثم تأكيداً صريحاً.")
+                adv_pw = st.text_input(
+                    "أعد إدخال كلمة مرور المدير لتفعيل زر المسح",
+                    type="password",
+                    key="admin_wipe_reauth_pw",
+                )
+                if adv_pw == "1948baba":
+                    st.warning("سيُحذف كل سجل الجرد من جدول Supabase `daily_audit_log` نهائياً.")
+                    wipe_ok = st.checkbox(
+                        "أؤكد رغبتي في مسح كل السجلات السحابية نهائياً",
+                        key="admin_wipe_confirm_chk",
+                    )
+                    st.markdown(
+                        "<p style='color:#b91c1c;font-weight:700;margin:0.5rem 0;'>"
+                        "🗑️ زر المسح النهائي (لا يمكن التراجع)</p>",
+                        unsafe_allow_html=True,
+                    )
+                    if st.button(
+                        "🗑️ مسح جميع السجلات في السحابة الآن",
+                        type="secondary",
+                        key="admin_wipe_all_btn",
+                    ):
+                        if wipe_ok:
+                            try:
+                                clear_supabase_audit_log()
+                                st.cache_data.clear()
+                                st.success("تم مسح سجل الجرد في Supabase.")
+                                st.rerun()
+                            except Exception as wipe_err:
+                                st.error(f"تعذر إكمال المسح: {wipe_err}")
+                        else:
+                            st.error("فعّل خانة التأكيد أولاً.")
+                elif adv_pw:
+                    st.error("كلمة المرور غير صحيحة.")
+        except Exception as admin_err:
+            st.error(f"تعذر قراءة سجل الجرد من Supabase: {admin_err}")
+
+elif menu == "🖨️ الطباعة والواتساب":
     st.header("🖨️ التقرير والواتساب")
     khallfa_on_duty = str(st.session_state.get("khallfa_name", "")).strip() or "لم يحدد"
 
@@ -550,7 +951,7 @@ if menu == "🖨️ الطباعة والواتساب":
             # 4. جلب القسم
             section_name = item_info['القسم'].values[0] if not item_info.empty else "عام"
 
-            # 5. تجهيز صف البيانات بنفس ترتيب هيدر Daily_Log.csv (بدون أي إزاحة)
+            # 5. تجهيز صف البيانات بنفس ترتيب أعمدة السجل المعتمدة (بدون إزاحة)
             row_date = iraq_now.strftime('%Y-%m-%d')
             row_time = time_now
             row_item = k
@@ -582,15 +983,17 @@ if menu == "🖨️ الطباعة والواتساب":
         )
 
         # أزرار الإرسال
-        col_wa, col_gs = st.columns(2)
+        col_wa, col_save = st.columns(2)
         with col_wa:
-            # استخدام wa_text المحدث الذي يحتوي على الملاحظات
             encoded_msg = requests.utils.quote(wa_text)
             st.link_button("🟢 إرسال واتساب", f"https://wa.me/?text={encoded_msg}")
-        with col_gs:
+        with col_save:
             if st.button("✅ إرسال الجرد وحفظه في السجل"):
                 if not str(st.session_state.get("khallfa_name", "")).strip():
                     st.error("يرجى كتابة اسم المسؤول/الخلفة أولاً قبل الإرسال.")
+                    st.stop()
+                if supabase_client is None:
+                    st.error("❌ Supabase غير متصل. لا يمكن حفظ السجل السحابي.")
                     st.stop()
                 invalid_messages = []
                 for row in inventory_data:
@@ -602,54 +1005,15 @@ if menu == "🖨️ الطباعة والواتساب":
                     for warning_msg in sorted(set(invalid_messages)):
                         st.warning(warning_msg)
                     st.stop()
-                # حفظ محلي متوافق مع Daily_Log.csv
                 save_df = pd.DataFrame(inventory_data, columns=DAILY_LOG_HEADERS)
-                save_df.to_csv(
-                    DAILY_LOG_FILE,
-                    mode="a",
-                    index=False,
-                    header=not os.path.exists(DAILY_LOG_FILE) or os.path.getsize(DAILY_LOG_FILE) == 0,
-                    encoding="utf-8-sig"
-                )
-
-                daily_sheet = get_log_worksheet(spreadsheet)
-                # ترتيب Google Sheets المطلوب:
-                # A التاريخ | B الوقت | C اسم السلعة | D المتوفر | E المطلوب | F اسم المسؤول | G الملاحظات | H الوحدة
-                gs_rows = []
-                for k, v in ordered.items():
-                    item_info = st.session_state.inventory_db[st.session_state.inventory_db['السلعة'] == k]
-                    unit_value = str(v.get("unit", "") or "")
-                    required_qty = float(v.get("req", 0) or 0)
-                    if not unit_value and not item_info.empty:
-                        unit_value = str(item_info['الوحدة'].values[0])
-                    if required_qty == 0 and not item_info.empty:
-                        required_qty = float(item_info['الحد_الأدنى'].values[0])
-
-                    available_qty = float(v.get("qty", 0) or 0)
-                    item_name = k
-                    current_date = iraq_now.strftime('%Y-%m-%d')
-                    current_time = time_now
-                    user_note = str(v.get("note", st.session_state.get(f"n_{k}", "")) or "").strip()
-                    full_manager_name = f"{current_shift} - {str(st.session_state.get('khallfa_name', '')).strip()}"
-                    section_name = str(item_info['القسم'].values[0]).strip() if (not item_info.empty and 'القسم' in item_info.columns) else "عام"
-                    gs_rows.append([
-                        current_date,
-                        current_time,
-                        item_name,
-                        available_qty,
-                        required_qty,
-                        full_manager_name,
-                        user_note,
-                        unit_value,
-                        section_name
-                    ])
-                daily_sheet.append_rows(gs_rows, value_input_option="USER_ENTERED")
-                st.success("✅ تم الإرسال بنجاح!")
+                try:
+                    append_log_rows_to_supabase(save_df)
+                    st.success("✅ تم حفظ الجرد في Supabase بنجاح.")
+                except Exception as e:
+                    st.error(f"❌ فشل حفظ السجل في Supabase: {e}")
+                    st.stop()
                 reset_inventory_inputs()
                 st.rerun()
-            
-            import urllib.parse
-            encoded_msg = urllib.parse.quote(wa_text)
 
             st.write("📲 **إرسال التقرير عبر الواتساب:**")
             st.caption("تمت إزالة قوائم الأسماء الثابتة من الكود.")
@@ -663,7 +1027,7 @@ if menu == "🖨️ الطباعة والواتساب":
         <div class="print-container" style="direction:rtl; text-align:right; font-family:Arial; color:black; background:white; padding:20px;">
             <center>
                 <h2 style="margin:0;">مخابز باب الآغا</h2>
-                <p>التاريخ: {datetime.now().strftime('%Y-%m-%d')} | الوقت: {time_now}</p>
+                <p>التاريخ: {iraq_now.strftime('%Y-%m-%d')} | الوقت: {time_now}</p>
                 <p><b>المسؤول/الخلفة: {khallfa_on_duty}</b></p>
                 <p><b>الشفت: {current_shift}</b></p>
             </center>
@@ -708,7 +1072,7 @@ if menu == "🖨️ الطباعة والواتساب":
                     </div>
                     <table style="width:100%; color:black; margin-bottom:10px; font-size:14px;">
                         <tr>
-                            <td><b>التاريخ:</b> {datetime.now().strftime('%Y-%m-%d')}</td>
+                            <td><b>التاريخ:</b> {iraq_now.strftime('%Y-%m-%d')}</td>
                             <td style="text-align:left;"><b>المسؤول/الخلفة:</b> {khallfa_on_duty}</td>
                         </tr>
                         <tr>
