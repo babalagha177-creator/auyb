@@ -1,7 +1,10 @@
 streamlit
 pandas
-gspread
-oauth2client
-google-auth
-datetime
 pytz
+requests
+# 2.15–2.19: create_client يرفض مفاتيح sb_secret_/sb_publishable_ (خطأ Invalid API key محلياً).
+# 2.26+ يجرّ storage3 الذي يعتمد pyiceberg وقد يفشل البناء على Windows بدون MSVC.
+supabase>=2.22.4,<2.26.0
+reportlab
+arabic-reshaper
+python-bidi
